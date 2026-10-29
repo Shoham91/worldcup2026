@@ -1,0 +1,168 @@
+// World Cup 2026 prediction pool — data model
+// Postgres (Neon in production). Local dev works against any Postgres URL.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // pooled connection (app runtime)
+  directUrl = env("DIRECT_URL") // direct connection (migrations / db push)
+}
+
+// ---------------------------------------------------------------------------
+// People
+// ---------------------------------------------------------------------------
+
+model User {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  pinHash   String
+  isAdmin   Boolean  @default(false)
+  paid      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  // Blind signup picks (locked the moment the user registers)
+  championTeamId Int?
+  finalistTeamId Int?
+  topScorerName  String?
+
+  groupPredictions GroupPrediction[]
+  matchPredictions MatchPrediction[]
+}
+
+// ---------------------------------------------------------------------------
+// Tournament reference data
+// ---------------------------------------------------------------------------
+
+model Team {
+  id        Int    @id @default(autoincrement())
+  name      String @unique
+  code      String // 3-letter code, used for flags / compact display
+  groupName String // "A".."L"
+
+  // Actual final group position, filled in by the admin (1=winner ... 4=last)
+  groupFinish Int?
+
+  players Player[]
+
+  groupPredFirst  GroupPrediction[] @relation("predFirst")
+  groupPredSecond GroupPrediction[] @relation("predSecond")
+  groupPredThird  GroupPrediction[] @relation("predThird")
+
+  homeMatches Match[] @relation("homeTeam")
+  awayMatches Match[] @relation("awayTeam")
+}
+
+// Curated goal-scorer candidates, used to populate the top-scorer dropdown.
+model Player {
+  id     Int    @id @default(autoincrement())
+  name   String
+  teamId Int
+  team   Team   @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([name, teamId])
+}
+
+// A knockout fixture. Teams are filled in by the admin as the bracket resolves
+// (rolling rounds), then scores + the advancing team are entered after kickoff.
+model Match {
+  id        Int      @id @default(autoincrement())
+  round     String // "GROUP" | "R32" | "R16" | "QF" | "SF" | "THIRD" | "FINAL"
+  slot      Int // position within the round (1-based); group matches use 1..72 in schedule order
+  groupName String? // set for group-stage matches
+  kickoff   DateTime?
+  label     String? // optional human label, e.g. "Winner A vs Runner-up B"
+
+  homeTeamId Int?
+  awayTeamId Int?
+  homeTeam   Team? @relation("homeTeam", fields: [homeTeamId], references: [id])
+  awayTeam   Team? @relation("awayTeam", fields: [awayTeamId], references: [id])
+
+  // Result (regulation/90-min score is what scorelines are graded against)
+  homeScore    Int?
+  awayScore    Int?
+  winnerTeamId Int? // who actually advanced (may differ on penalties)
+  played       Boolean @default(false)
+
+  predictions MatchPrediction[]
+
+  @@unique([round, slot])
+}
+
+// ---------------------------------------------------------------------------
+// Predictions
+// ---------------------------------------------------------------------------
+
+model GroupPrediction {
+  id        Int    @id @default(autoincrement())
+  userId    Int
+  groupName String // "A".."L"
+
+  firstTeamId  Int
+  secondTeamId Int
+  thirdTeamId  Int? // deprecated — 3rd place is no longer predicted
+
+  isRandom Boolean @default(false) // auto-filled because the user missed the deadline
+
+  createdAt DateTime @default(now()) // when this pick was written (incl. re-randomise)
+
+  user        User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstTeam   Team  @relation("predFirst", fields: [firstTeamId], references: [id])
+  secondTeam  Team  @relation("predSecond", fields: [secondTeamId], references: [id])
+  thirdTeam   Team? @relation("predThird", fields: [thirdTeamId], references: [id])
+
+  @@unique([userId, groupName])
+}
+
+model MatchPrediction {
+  id     Int @id @default(autoincrement())
+  userId Int
+  matchId Int
+
+  homeScore    Int
+  awayScore    Int
+  winnerTeamId Int? // predicted team to advance (knockout only; null for group games)
+
+  isRandom Boolean @default(false)
+
+  createdAt DateTime @default(now()) // when this pick was written (incl. re-randomise)
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, matchId])
+}
+
+// ---------------------------------------------------------------------------
+// Phases / lock windows + tournament-wide actual results
+// ---------------------------------------------------------------------------
+
+// One row per prediction window. The admin sets locksAt (= 30 min before the
+// round's first game) and flips isOpen. Predictions are editable while
+// isOpen && now < locksAt.
+model Phase {
+  id      Int      @id @default(autoincrement())
+  key     String   @unique // "GROUP" | "R32" | "R16" | "QF" | "SF" | "FINAL"
+  label   String
+  sort    Int
+  isOpen  Boolean  @default(false)
+  locksAt DateTime?
+}
+
+// Singleton (id = 1) holding tournament-level actual outcomes for scoring.
+model Tournament {
+  id                 Int     @id @default(1)
+  championTeamId     Int?
+  runnerUpTeamId     Int?
+  topScorerName      String?
+  buyIn              Int     @default(50) // ILS per player
+  registrationClosed Boolean @default(false) // when true, the pot/prizes are final
+  syncEnabled        Boolean @default(true) // when false, the auto-results sync is paused
+
+  // Live top-scorer chart for display only (updated every sync). Shape:
+  // [{ name: string, team: string, goals: number }]. NOT a scoring input —
+  // the scoring top-scorer (topScorerName) is locked until the tournament ends.
+  topScorers Json?
+}
